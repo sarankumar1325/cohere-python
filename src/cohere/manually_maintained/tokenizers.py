@@ -11,6 +11,9 @@ if typing.TYPE_CHECKING:
 TOKENIZER_CACHE_KEY = "tokenizers"
 logger = logging.getLogger(__name__)
 
+# Seconds to wait for the tokenizer config host before giving up.
+_REQUEST_TIMEOUT_SECONDS = 30
+
 
 def tokenizer_cache_key(model: str) -> str:
     return f"{TOKENIZER_CACHE_KEY}:{model}"
@@ -25,16 +28,9 @@ def get_hf_tokenizer(co: "Client", model: str) -> Tokenizer:
     if not tokenizer_url:
         raise ValueError(f"No tokenizer URL found for model {model}")
 
-    # Print the size of the tokenizer config before downloading it.
-    try:
-        size = _get_tokenizer_config_size(tokenizer_url)
-        logger.info(f"Downloading tokenizer for model {model}. Size is {size} MBs.")
-    except Exception as e:
-        # Skip the size logging, this is not critical.
-        logger.warn(f"Failed to get the size of the tokenizer config: {e}")
+    _log_tokenizer_config_size(model, tokenizer_url)
 
-    response = requests.get(tokenizer_url)
-    tokenizer = Tokenizer.from_str(response.text)
+    tokenizer = Tokenizer.from_str(_download_tokenizer_config(tokenizer_url))
 
     co._cache_set(tokenizer_cache_key(model), tokenizer)
     return tokenizer
@@ -62,16 +58,11 @@ async def async_get_hf_tokenizer(co: "AsyncClient", model: str) -> Tokenizer:
     if not tokenizer_url:
         raise ValueError(f"No tokenizer URL found for model {model}")
 
-    # Print the size of the tokenizer config before downloading it.
-    try:
-        size = _get_tokenizer_config_size(tokenizer_url)
-        logger.info(f"Downloading tokenizer for model {model}. Size is {size} MBs.")
-    except Exception as e:
-        # Skip the size logging, this is not critical.
-        logger.warn(f"Failed to get the size of the tokenizer config: {e}")
-
-    response = await asyncio.get_event_loop().run_in_executor(None, requests.get, tokenizer_url)
-    tokenizer = Tokenizer.from_str(response.text)
+    # Both requests are blocking, so keep them off the event loop.
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _log_tokenizer_config_size, model, tokenizer_url)
+    config = await loop.run_in_executor(None, _download_tokenizer_config, tokenizer_url)
+    tokenizer = Tokenizer.from_str(config)
 
     co._cache_set(tokenizer_cache_key(model), tokenizer)
     return tokenizer
@@ -89,10 +80,27 @@ async def async_local_detokenize(co: "AsyncClient", model: str, tokens: typing.S
     return tokenizer.decode(tokens)
 
 
+def _log_tokenizer_config_size(model: str, tokenizer_url: str) -> None:
+    # Log the size of the tokenizer config before downloading it.
+    try:
+        size = _get_tokenizer_config_size(tokenizer_url)
+        logger.info(f"Downloading tokenizer for model {model}. Size is {size} MBs.")
+    except Exception as e:
+        # Skip the size logging, this is not critical.
+        logger.warning(f"Failed to get the size of the tokenizer config: {e}")
+
+
+def _download_tokenizer_config(tokenizer_url: str) -> str:
+    response = requests.get(tokenizer_url, timeout=_REQUEST_TIMEOUT_SECONDS)
+    # Fail with the HTTP status instead of an opaque error from the tokenizer parser.
+    response.raise_for_status()
+    return response.text
+
+
 def _get_tokenizer_config_size(tokenizer_url: str) -> float:
     # Get the size of the tokenizer config before downloading it.
     # Content-Length is not always present in the headers (if transfer-encoding: chunked).
-    head_response = requests.head(tokenizer_url)
+    head_response = requests.head(tokenizer_url, timeout=_REQUEST_TIMEOUT_SECONDS)
     size = None
     for header in ["x-goog-stored-content-length", "Content-Length"]:
         size = head_response.headers.get(header)
